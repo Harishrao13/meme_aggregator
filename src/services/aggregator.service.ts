@@ -1,124 +1,180 @@
-import axios from "axios";
+import { DexPair } from "../models/DexPair.js";
 import { DexService } from "./dex.service.js";
 import { JupiterService } from "./jupiter.service.js";
 import { GeckoService } from "./gecko.service.js";
 
-import { DexPair } from "../models/DexPair.js"
+import { AggregatedResult } from "../models/AggregatedResult.js";
+import { JupiterData } from "../models/Jupiter.js";
+import { GeckoData } from "../models/GeckoData.js";
 
-async function backoff(fn: () => Promise<any>, retries = 3, delay = 300) {
+async function backoff<T>(fn: () => Promise<T>, retries = 3, delay = 300): Promise<T> {
   let attempt = 0;
-  while (attempt <= retries) {
+  while (true) {
     try {
       return await fn();
-    } catch (e) {
-      if (attempt === retries) throw e;
-      await new Promise(r => setTimeout(r, delay * Math.pow(2, attempt)));
-      attempt++;
+    } catch (err) {
+      if (attempt >= retries) throw err;
+      // exponential backoff
+      await new Promise((resolve) => setTimeout(resolve, delay * Math.pow(2, attempt)));
+      attempt += 1;
     }
   }
 }
 
 export class AggregatorService {
-  static async getSolUsd(jup: any, gecko: any, pool: any) {
+  /**
+   * Try several sources for SOL <-> USD conversion
+   */
+  static async getSolUsd(
+    jupiterData: JupiterData | null,
+    geckoData: GeckoData | null,
+    pool: DexPair | null
+  ): Promise<number> {
     try {
-      const sol = await backoff(() => JupiterService.getJupiterData("SOL"));
-      if (sol?.[0]?.usdPrice) return Number(sol[0].usdPrice);
-    } catch {}
-
-    try {
-      if (gecko?.attributes?.symbol === "SOL") {
-        return Number(gecko.attributes.price_usd);
+      const solData = await backoff(() => JupiterService.getJupiterData("SOL") as Promise<unknown>);
+      // solData may be array or object
+      if (Array.isArray(solData) && (solData[0] as any)?.usdPrice) {
+        return Number((solData[0] as any).usdPrice);
       }
-    } catch {}
+      if ((solData as any)?.usdPrice) return Number((solData as any).usdPrice);
+    } catch {
+      // fall through to next source
+    }
 
     try {
-      if (pool?.priceUsd && pool?.priceNative) {
-        return Number(pool.priceUsd) / Number(pool.priceNative);
+      if (geckoData?.attributes?.symbol?.toUpperCase() === "SOL" && geckoData.attributes.price_usd) {
+        return Number(geckoData.attributes.price_usd);
       }
-    } catch {}
+    } catch {
+      // fall through
+    }
 
+    try {
+      if (pool?.priceUsd && (pool as any).priceNative) {
+        return Number((pool as any).priceUsd) / Number((pool as any).priceNative);
+      }
+    } catch {
+      // fall through
+    }
+
+    // fallback default
     return 1;
   }
 
-  static async liquidityWeightedAggregate(tokenAddress: string, symbol?: string) {
+  /**
+   * liquidityWeightedAggregate
+   * - tokenAddress is authoritative (address-based lookup)
+   * - symbol is optional and only used to help find Jupiter/gecko results, NOT to replace token_address
+   * - If both tokenAddress and symbol are provided, tokenAddress has priority. If tokenAddress lookup fails
+   *   and symbol does not exactly match on Jupiter/Gecko, return error.
+   */
+  static async liquidityWeightedAggregate(
+    tokenAddress: string | null,
+    symbol?: string | null
+  ): Promise<AggregatedResult> {
+    const normalizedAddress: string | null = tokenAddress ? tokenAddress.toLowerCase() : null;
+    const normalizedSymbol: string | null = symbol ? symbol.toUpperCase() : null;
+
+    // fetch sources in parallel with retries
     const [dexRes, jupRes, geckoRes] = await Promise.allSettled([
-      backoff(() => DexService.getDexData(tokenAddress)),
-      backoff(() => JupiterService.getJupiterData(symbol || "")),
-      backoff(() => GeckoService.getGeckoData("solana", tokenAddress))
+      backoff(() => DexService.getDexData(normalizedAddress as string)).catch((e) => null),
+      backoff(() => JupiterService.getJupiterData(normalizedSymbol || "")).catch((e) => null),
+      backoff(() => GeckoService.getGeckoData("solana", normalizedAddress as string)).catch((e) => null)
     ]);
 
-    const dex = dexRes.status === "fulfilled" ? dexRes.value : null;
-    const jup = jupRes.status === "fulfilled" ? (Array.isArray(jupRes.value) ? jupRes.value[0] : jupRes.value) : null;
-    const gecko = geckoRes.status === "fulfilled" ? geckoRes.value?.data ?? null : null;
+    const dexData = dexRes.status === "fulfilled" ? dexRes.value : null;
+    const jupiterRaw = jupRes.status === "fulfilled" ? jupRes.value : null;
 
-    const pools: DexPair[] = Array.isArray(dex?.pairs) ? dex.pairs : [];
-    const validPools = pools.filter(p => p?.baseToken?.address === tokenAddress);
-    
+    // Jupiter sometimes returns an array or an object
+    const JupiterData: JupiterData | null = jupiterRaw
+      ? Array.isArray(jupiterRaw)
+        ? (jupiterRaw[0] as JupiterData)
+        : (jupiterRaw as JupiterData)
+      : null;
 
-    let totalLiq = 0;
-    let totalVol = 0;
-    let weightedPrice = 0;
-    let weightedHr = 0;
-    let txCount = 0;
+    const geckoWrapped = geckoRes.status === "fulfilled" ? geckoRes.value : null;
+    const geckoData: GeckoData | null = geckoWrapped ? (geckoWrapped.data ?? geckoWrapped) : null;
 
-    for (const p of validPools) {
-      const liq = Number(p?.liquidity?.usd || 0);
-      const vol = Number(p?.volume?.h24 || 0);
-      const price = Number(p?.priceUsd || 0);
-      const change = Number(p?.priceChange?.h1 || 0);
-      const buys = Number(p?.txns?.h24?.buys || 0);
-      const sells = Number(p?.txns?.h24?.sells || 0);
+    // --- 1) STRICT ADDRESS MATCH ---
+    const pairs: DexPair[] = Array.isArray(dexData?.pairs) ? dexData.pairs : [];
+    const matchingPools: DexPair[] = pairs.filter((p) => ((p?.baseToken?.address ?? "") as string).toLowerCase() === (normalizedAddress ?? ""));
 
-      totalLiq += liq;
-      totalVol += vol;
-      weightedPrice += price * liq;
-      weightedHr += change * liq;
-      txCount += buys + sells;
+    // Exact symbol matches (used only when address lookup isn't decisive)
+    const jupiterSymbolMatch: boolean = !!(JupiterData?.symbol && normalizedSymbol && JupiterData.symbol.toUpperCase() === normalizedSymbol);
+    const geckoSymbolMatch: boolean = !!(geckoData?.attributes?.symbol && normalizedSymbol && geckoData.attributes.symbol.toUpperCase() === normalizedSymbol);
+
+    const anyExactSymbolMatch = normalizedSymbol ? (jupiterSymbolMatch || geckoSymbolMatch) : false;
+
+    // --- 2) If tokenAddress given but no matching pools AND no exact symbol match -> NOT FOUND
+    // Priority: tokenAddress first. Only if address not found and symbol is an exact match do we continue.
+    if (normalizedAddress && matchingPools.length === 0 && !anyExactSymbolMatch) {
+      return {
+        error: "Token doesn't exist",
+        token_address: normalizedAddress,
+        symbol: normalizedSymbol ?? null,
+        token_name: "",
+        token_ticker: normalizedSymbol ?? "",
+        price_sol: 0,
+        liquidity_sol: 0,
+        volume_sol: 0,
+        transaction_count: 0,
+        aggregated_price_usd: 0,
+        aggregated_price_sol: 0,
+        best_pool: null,
+        protocol: "UNKNOWN"
+      };
     }
 
-    const bestPool = validPools.reduce((t, p) =>
-      Number(p?.liquidity?.usd || 0) > Number(t?.liquidity?.usd || 0) ? p : t,
-      validPools[0] || null
-    );
+    // --- 3) Continue aggregation ---
+    let totalLiquidityUsd = 0;
+    let totalVolumeUsd = 0;
+    let weightedPriceSum = 0;
+    let weightedHourChangeSum = 0;
+    let transactionCount = 0;
 
-    const solUsd = await this.getSolUsd(jup, gecko, bestPool);
-    const aggregatedPriceUsd = totalLiq > 0 ? weightedPrice / totalLiq : Number(jup?.usdPrice || gecko?.attributes?.price_usd || 0);
+    for (const pool of matchingPools) {
+      const liquidityUsd = Number((pool.liquidity as any)?.usd ?? 0);
+      const volume24hUsd = Number((pool.volume as any)?.h24 ?? 0);
+      const priceUsd = Number((pool as any).priceUsd ?? 0);
+
+      totalLiquidityUsd += liquidityUsd;
+      totalVolumeUsd += volume24hUsd;
+      weightedPriceSum += priceUsd * liquidityUsd;
+      weightedHourChangeSum += Number((pool as any).priceChange?.h1 ?? 0) * liquidityUsd;
+      transactionCount += Number((pool as any).txns?.h24?.buys ?? 0) + Number((pool as any).txns?.h24?.sells ?? 0);
+    }
+
+    const bestPool: DexPair | null = matchingPools.length > 0
+      ? matchingPools.reduce((best, curr) => Number((curr as any).liquidity?.usd ?? 0) > Number((best as any).liquidity?.usd ?? 0) ? curr : best, matchingPools[0])
+      : null;
+
+    const solUsd = await this.getSolUsd(JupiterData, geckoData, bestPool);
+
+    const aggregatedPriceUsd = totalLiquidityUsd > 0
+      ? weightedPriceSum / totalLiquidityUsd
+      : Number(JupiterData?.usdPrice ?? geckoData?.attributes?.price_usd ?? 0);
+
     const aggregatedPriceSol = solUsd ? aggregatedPriceUsd / solUsd : aggregatedPriceUsd;
 
-    const liquiditySol = solUsd ? totalLiq / solUsd : totalLiq;
-    const volumeSol = solUsd ? totalVol / solUsd : totalVol;
-    const hrChange = totalLiq > 0 ? weightedHr / totalLiq : Number(jup?.stats1h?.priceChange || 0);
-
-    const bestUsd = jup?.usdPrice ? Number(jup.usdPrice) : Number(bestPool?.priceUsd || 0);
-    const bestSol = solUsd ? bestUsd / solUsd : bestUsd;
-
-    const protocol = bestPool
-      ? `${String(bestPool.dexId).toUpperCase()} ${((bestPool.labels || []).join(" "))}`.trim()
-      : jup ? "JUPITER" : "UNKNOWN";
-
     return {
-      token_address: bestPool?.baseToken?.address || jup?.id || gecko?.attributes?.address || tokenAddress,
-      token_name: bestPool?.baseToken?.name || jup?.name || gecko?.attributes?.name || "",
-      token_ticker: bestPool?.baseToken?.symbol || jup?.symbol || gecko?.attributes?.symbol || symbol || "",
-      price_sol: aggregatedPriceSol || 0,
-      market_cap_sol: gecko?.attributes?.market_cap_usd ? Number(gecko.attributes.market_cap_usd) / solUsd : 0,
-      volume_sol: volumeSol || 0,
-      liquidity_sol: liquiditySol || 0,
-      transaction_count: txCount || 0,
-      price_1hr_change: hrChange || 0,
-      protocol,
-      aggregated_price_usd: aggregatedPriceUsd || 0,
-      aggregated_price_sol: aggregatedPriceSol || 0,
-      best_price_usd: bestUsd || 0,
-      best_price_sol: bestSol || 0,
+      token_address: normalizedAddress,
+      token_name: bestPool?.baseToken?.name ?? JupiterData?.name ?? geckoData?.attributes?.name ?? "",
+      token_ticker: bestPool?.baseToken?.symbol ?? JupiterData?.symbol ?? geckoData?.attributes?.symbol ?? (symbol ?? ""),
+      price_sol: aggregatedPriceSol ?? 0,
+      liquidity_sol: solUsd ? totalLiquidityUsd / solUsd : totalLiquidityUsd,
+      volume_sol: solUsd ? totalVolumeUsd / solUsd : totalVolumeUsd,
+      transaction_count: transactionCount,
+      aggregated_price_usd: aggregatedPriceUsd ?? 0,
+      aggregated_price_sol: aggregatedPriceSol ?? 0,
       best_pool: bestPool
         ? {
-            dexId: bestPool.dexId,
-            pairAddress: bestPool.pairAddress,
-            priceUsd: bestPool.priceUsd,
-            liquidityUsd: bestPool.liquidity?.usd
+            dexId: (bestPool as any).dexId,
+            pairAddress: (bestPool as any).pairAddress,
+            priceUsd: (bestPool as any).priceUsd,
+            liquidityUsd: (bestPool as any).liquidity?.usd
           }
-        : null
+        : null,
+      protocol: bestPool ? (bestPool as any).dexId ?? "UNKNOWN" : "UNKNOWN"
     };
   }
 }
