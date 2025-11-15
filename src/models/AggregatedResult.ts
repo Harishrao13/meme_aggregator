@@ -17,4 +17,16 @@ export interface AggregatedResult {
   protocol: string;
   error?: string;
   symbol?: string | null;
+  scoreComponents?: ScoreComponents
+  price_1hr_change?: Number
+  price_24hr_change?: Number
+  price_7d_change?: Number
+
+}
+
+export interface ScoreComponents {
+  liquidity_log: number;
+  volume_log: number;
+  txcount_log: number;
+  price_change_abs: number;
 }
