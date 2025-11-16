@@ -17,11 +17,11 @@ export interface AggregatedResult {
   protocol: string;
   error?: string;
   symbol?: string | null;
-  scoreComponents?: ScoreComponents
-  price_1hr_change?: Number
-  price_24hr_change?: Number
-  price_7d_change?: Number
-
+  scoreComponents?: ScoreComponents;
+  price_1hr_change?: Number;
+  price_24hr_change?: Number;
+  price_7d_change?: Number;
+  last_updated_ts?: Number;
 }
 
 export interface ScoreComponents {
