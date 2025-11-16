@@ -1,4 +1,3 @@
-// workers/scheduler.cron.ts
 import cron from "node-cron";
 import { runRankingOnce } from "./ranking.worker.js";
 import { runDiscoveryLoop } from "./discovery.worker.js";

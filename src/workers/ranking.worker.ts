@@ -311,7 +311,6 @@ async function publishTopChangeIfNeeded(prevTop: string[] | null, limit = 20): P
   const newTop = await client.zrevrange(SCORE_ZSET_KEY, 0, limit - 1);
   const changed = !prevTop || prevTop.length !== newTop.length || prevTop.some((a, i) => a !== newTop[i]);
   if (changed) {
-    console.log("TOP20 CHANGED SLAVA")
     await client.publish(`discover:${CHAIN}:updated`, JSON.stringify({ top: newTop, ts: Date.now() }));
 
     const pipe = client.multi();
@@ -324,7 +323,6 @@ async function publishTopChangeIfNeeded(prevTop: string[] | null, limit = 20): P
     }
     try {
       await pipe.exec();
-      console.log("pipe exec success harish")
     } catch (e) {
       console.warn("publishTopChangeIfNeeded: failed to update last_top_ts", e);
     }
